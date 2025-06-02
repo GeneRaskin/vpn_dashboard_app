@@ -1,0 +1,19 @@
+body {
+  font-family: sans-serif;
+  padding: 2rem;
+  background-color: #f9f9f9;
+}
+input {
+  padding: 0.5rem;
+  width: 300px;
+}
+button {
+  padding: 0.5rem 1rem;
+  margin-left: 1rem;
+}
+pre {
+  background: #eee;
+  padding: 1rem;
+  margin-top: 1rem;
+  white-space: pre-wrap;
+}

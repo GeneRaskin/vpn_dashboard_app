@@ -1,0 +1,12 @@
+*.auto.tfbackend
+.terraform
+*.zip
+*.tfstate
+*.tfvars
+
+#Lambda build artifacts
+backend/get_user_config/index.js
+backend/get_user_config/node_modules/
+backend/get_user_config/origin.txt
+
+.DS_Store
