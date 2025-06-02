@@ -47,7 +47,6 @@ resource "aws_lambda_function" "this" {
     role = aws_iam_role.lambda_exec.arn
 
     filename = "${path.module}/../../backend/get_user_config/function.zip"
-    source_code_hash = filebase64sha256("${path.module}/../../backend/get_user_config/function.zip")
 
     environment {
         variables = var.environment_variables

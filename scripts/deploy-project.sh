@@ -37,12 +37,21 @@ terraform init -backend-config=backend-config.auto.tfbackend -reconfigure
 terraform apply -target=module.frontend -auto-approve -var-file="$VARS_FILE"
 
 echo "🧠 Templating + Zipping Lambda..."
-terraform output -raw website_url > ../backend/get_user_config/origin.txt
+# Capture terraform output cleanly and extract just the URL
+origin=$(terraform output -raw website_url | grep -Eo 'https://[^:]+' | head -n1 | tr -d '\r\n')
+if [ $? -ne 0 ] || [ -z "$origin" ]; then
+  echo "❌ Failed to get website_url from terraform output"
+  exit 1
+fi
+
+echo "$origin" > ../backend/get_user_config/origin.txt
 cd ../backend/get_user_config
-origin=$(cat origin.txt)
 
 echo "🌐 Using allowed origin: $origin"
-sed "s|\${allowed_origin}|${origin}|" index.template.js > index.js
+
+export allowed_origin="$origin"
+envsubst < index.template.js > index.js
+
 npm install
 zip function.zip index.js node_modules package.json
 

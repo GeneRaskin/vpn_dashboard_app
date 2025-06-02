@@ -2,9 +2,9 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ dev, main ]
+    branches: [ dev ]
   pull_request:
-    branches: [ dev, main ]
+    branches: [ main ]
   # Manual trigger for testing
   workflow_dispatch:
 
@@ -25,6 +25,7 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '18'
+          cache-dependency-path: backend/get_user_config/package-lock.json
           cache: 'npm'
 
       - name: Configure AWS Credentials
@@ -38,6 +39,13 @@ jobs:
         uses: hashicorp/setup-terraform@v2
         with:
           terraform_version: '1.5.0'
+      
+      - name: Setup backend
+        run: |
+          ./scripts/init-backend.sh << EOF
+          ${{ secrets.AWS_REGION }}
+          ${{ secrets.ORGANIZATION_NAME }}
+          EOF
 
       - name: Deploy to Development
         run: |
@@ -45,21 +53,19 @@ jobs:
           ${{ secrets.AWS_REGION }}
           dev
           ${{ secrets.PROJECT_NAME }}
-          ./scripts/deploy-project.sh
           EOF
+          ./scripts/deploy-project.sh
 
       - name: Get Endpoints
         id: get-endpoints
         run: |
-          # Wait for files to be generated
-          sleep 100
-          
+
           # Get API endpoint from Terraform outputs
-          API_ENDPOINT=$(terraform -chdir=infra output -raw api_endpoint)
+          API_ENDPOINT=$(terraform -chdir=infra output -raw api_endpoint | grep -Eo 'https://[^:]+' | head -n1 | tr -d '\r\n')
           echo "api_endpoint=${API_ENDPOINT}" >> $GITHUB_OUTPUT
           
           # Get S3 origin from generated file
-          S3_ORIGIN=$(cat backend/get_user_config/origin.txt)
+          S3_ORIGIN=$(cat backend/get_user_config/origin.txt | grep -Eo 'https://[^:]+' | head -n1 | tr -d '\r\n')
           echo "s3_origin=${S3_ORIGIN}" >> $GITHUB_OUTPUT
 
       - name: Run Integration Tests
@@ -85,13 +91,13 @@ jobs:
             ${{ steps.get-endpoints.outputs.api_endpoint }}/config?email=$TEST_EMAIL)
 
           # Check CORS headers
-          if [[ $PREFLIGHT_RESPONSE != *"Access-Control-Allow-Origin: ${{ steps.get-endpoints.outputs.s3_origin }}"* ]]; then
+          if [[ $PREFLIGHT_RESPONSE != *"access-control-allow-origin: ${{ steps.get-endpoints.outputs.s3_origin }}"* ]]; then
             echo "CORS preflight check failed - missing or incorrect Allow-Origin header"
             echo "$PREFLIGHT_RESPONSE"
             exit 1
           fi
 
-          if [[ $PREFLIGHT_RESPONSE != *"Access-Control-Allow-Methods: GET"* ]]; then
+          if [[ $PREFLIGHT_RESPONSE != *"access-control-allow-methods: GET,OPTIONS"* ]]; then
             echo "CORS preflight check failed - missing or incorrect Allow-Methods header"
             echo "$PREFLIGHT_RESPONSE"
             exit 1
@@ -113,7 +119,7 @@ jobs:
             -i \
             ${{ steps.get-endpoints.outputs.api_endpoint }}/config?email=$TEST_EMAIL)
           
-          if [[ $WRONG_ORIGIN_RESPONSE == *"Access-Control-Allow-Origin: http://wrong-origin.com"* ]]; then
+          if [[ $WRONG_ORIGIN_RESPONSE == *"access-control-allow-origin: http://wrong-origin.com"* ]]; then
             echo "CORS check failed - allowed incorrect origin"
             exit 1
           fi
@@ -122,7 +128,7 @@ jobs:
           RESPONSE=$(curl -s \
             -H "Origin: ${{ steps.get-endpoints.outputs.s3_origin }}" \
             ${{ steps.get-endpoints.outputs.api_endpoint }}/config?email=nonexistent@example.com)
-          if [[ $RESPONSE != *"404"* ]]; then
+          if [[ $RESPONSE != *"User not found"* ]]; then
             echo "Negative test case failed"
             exit 1
           fi
@@ -154,6 +160,7 @@ jobs:
           body: Integration tests failed. Please check the logs.
 
       - name: Cleanup dev environment
+        if: always()
         run: |
           ./scripts/cleanup-aws.sh << EOF
           ${{ secrets.AWS_REGION }}
@@ -174,13 +181,25 @@ jobs:
             This PR was automatically created after passing all integration tests.
             Please review and approve to deploy to production.
 
+          commit-message: |
+            Automatic PR from CI/CD pipeline
+
+            This PR was automatically created after passing all integration tests.
+            [skip actions]
+
   deploy-production:
-    needs: build-and-test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
     steps:
       - uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache-dependency-path: backend/get_user_config/package-lock.json
+          cache: 'npm'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v1
@@ -193,6 +212,13 @@ jobs:
         uses: hashicorp/setup-terraform@v2
         with:
           terraform_version: '1.5.0'
+      
+      - name: Setup backend
+        run: |
+          ./scripts/init-backend.sh << EOF
+          ${{ secrets.AWS_REGION }}
+          ${{ secrets.ORGANIZATION_NAME }}
+          EOF
 
       - name: Deploy to Production
         run: |
@@ -200,10 +226,11 @@ jobs:
           ${{ secrets.AWS_REGION }}
           prod
           ${{ secrets.PROJECT_NAME }}
-          ./scripts/deploy-project.sh
           EOF
+          ./scripts/deploy-project.sh
 
       - name: Notify Production Deployment
+        if: success()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
@@ -214,3 +241,16 @@ jobs:
           to: ${{ secrets.NOTIFICATION_EMAIL }}
           from: CI/CD Pipeline
           body: Production deployment completed successfully.
+  
+      - name: ❌ Notify Production Deployment Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Production Deployment Failed"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: CI/CD Pipeline
+          body: Production deployment failed. Please check the logs in the Actions tab.
