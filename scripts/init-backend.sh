@@ -6,10 +6,10 @@ echo "== Initialize Terraform Backend (Per Region) =="
 read -p "Enter AWS region [default: us-east-1]: " REGION
 REGION=${REGION:-us-east-1}
 
-RAND_SUFFIX=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 8)
+read -p "Enter organization name: " ORGANIZATION_NAME
 
-BUCKET="tf-state-${REGION}-$RAND_SUFFIX"
-LOCK_TABLE="tf-locks-${REGION}-$RAND_SUFFIX"
+BUCKET="tf-state-${REGION}-${ORGANIZATION_NAME}"
+LOCK_TABLE="tf-locks-${REGION}-${ORGANIZATION_NAME}"
 
 echo "📦 Using S3 state backend bucket: $BUCKET"
 echo "🔒 Using DynamoDB lock table: $LOCK_TABLE"
