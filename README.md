@@ -133,7 +133,7 @@ Required GitHub Secrets:
 - `PROJECT_NAME`
 - `ORGANIZATION_NAME`
 - `DYNAMODB_TABLE_BASENAME`
-- `GH_BOT_TOKEN`: This token is used by the [create-pull-request](https://github.com/peter-evans/create-pull-request) bot. Please refer to its README for proper token permission setup.
+- `GH_BOT_TOKEN`: This token is used to create a pull request
 - SMTP settings for notifications:
   - `SMTP_SERVER`
   - `SMTP_PORT`
