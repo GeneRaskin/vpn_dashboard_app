@@ -1,0 +1,254 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ dev, main ]
+  # Manual trigger for testing
+  workflow_dispatch:
+
+env:
+  # These would be set in GitHub Secrets
+  TABLE_NAME: ${{ secrets.DYNAMODB_TABLE_BASENAME }}  # Base table name without environment prefix
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # Only run full pipeline on dev branch or manual trigger
+    if: github.ref == 'refs/heads/dev' || github.event_name == 'workflow_dispatch'
+    environment: dev
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache-dependency-path: backend/get_user_config/package-lock.json
+          cache: 'npm'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: '1.5.0'
+      
+      - name: Setup backend
+        run: |
+          ./scripts/init-backend.sh << EOF
+          ${{ secrets.AWS_REGION }}
+          ${{ secrets.ORGANIZATION_NAME }}
+          EOF
+
+      - name: Deploy to Development
+        run: |
+          ./scripts/init-project.sh << EOF
+          ${{ secrets.AWS_REGION }}
+          dev
+          ${{ secrets.PROJECT_NAME }}
+          EOF
+          ./scripts/deploy-project.sh
+
+      - name: Get Endpoints
+        id: get-endpoints
+        run: |
+
+          # Get API endpoint from Terraform outputs
+          API_ENDPOINT=$(terraform -chdir=infra output -raw api_endpoint | grep -Eo 'https://[^:]+' | head -n1 | tr -d '\r\n')
+          echo "api_endpoint=${API_ENDPOINT}" >> $GITHUB_OUTPUT
+          
+          # Get S3 origin from generated file
+          S3_ORIGIN=$(cat backend/get_user_config/origin.txt | grep -Eo 'https://[^:]+' | head -n1 | tr -d '\r\n')
+          echo "s3_origin=${S3_ORIGIN}" >> $GITHUB_OUTPUT
+
+      - name: Run Integration Tests
+        id: integration_tests
+        run: |
+          # Construct DynamoDB table name
+          DYNAMODB_TABLE="${{ secrets.PROJECT_NAME }}-dev-${TABLE_NAME}"
+          
+          # Test adding a user
+          TEST_EMAIL="test@example.com"
+          TEST_DATA='{"email":"'$TEST_EMAIL'","config":"test-config"}'
+          
+          # Add test user to DynamoDB
+          aws dynamodb put-item \
+            --table-name $DYNAMODB_TABLE \
+            --item '{"email": {"S":"'$TEST_EMAIL'"}, "config": {"S":"test-config"}}'
+
+          # Test CORS preflight request
+          PREFLIGHT_RESPONSE=$(curl -X OPTIONS -i \
+            -H "Origin: ${{ steps.get-endpoints.outputs.s3_origin }}" \
+            -H "Access-Control-Request-Method: GET" \
+            -H "Access-Control-Request-Headers: Content-Type" \
+            ${{ steps.get-endpoints.outputs.api_endpoint }}/config?email=$TEST_EMAIL)
+
+          # Check CORS headers
+          if [[ $PREFLIGHT_RESPONSE != *"access-control-allow-origin: ${{ steps.get-endpoints.outputs.s3_origin }}"* ]]; then
+            echo "CORS preflight check failed - missing or incorrect Allow-Origin header"
+            echo "$PREFLIGHT_RESPONSE"
+            exit 1
+          fi
+
+          if [[ $PREFLIGHT_RESPONSE != *"access-control-allow-methods: GET,OPTIONS"* ]]; then
+            echo "CORS preflight check failed - missing or incorrect Allow-Methods header"
+            echo "$PREFLIGHT_RESPONSE"
+            exit 1
+          fi
+
+          # Test actual request with Origin header
+          RESPONSE=$(curl -s \
+            -H "Origin: ${{ steps.get-endpoints.outputs.s3_origin }}" \
+            ${{ steps.get-endpoints.outputs.api_endpoint }}/config?email=$TEST_EMAIL)
+          
+          if [[ $RESPONSE != *"test-config"* ]]; then
+            echo "Frontend fetch test failed"
+            exit 1
+          fi
+
+          # Test request with wrong origin (should fail CORS)
+          WRONG_ORIGIN_RESPONSE=$(curl -s \
+            -H "Origin: http://wrong-origin.com" \
+            -i \
+            ${{ steps.get-endpoints.outputs.api_endpoint }}/config?email=$TEST_EMAIL)
+          
+          if [[ $WRONG_ORIGIN_RESPONSE == *"access-control-allow-origin: http://wrong-origin.com"* ]]; then
+            echo "CORS check failed - allowed incorrect origin"
+            exit 1
+          fi
+
+          # Test non-existent email
+          RESPONSE=$(curl -s \
+            -H "Origin: ${{ steps.get-endpoints.outputs.s3_origin }}" \
+            ${{ steps.get-endpoints.outputs.api_endpoint }}/config?email=nonexistent@example.com)
+          if [[ $RESPONSE != *"User not found"* ]]; then
+            echo "Negative test case failed"
+            exit 1
+          fi
+
+      - name: Notify on Test Success
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "✅ Integration Tests Passed - Ready for Production"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: CI/CD Pipeline
+          body: Integration tests passed successfully. Ready to merge to main.
+
+      - name: Notify on Test Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Integration Tests Failed"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: CI/CD Pipeline
+          body: Integration tests failed. Please check the logs.
+
+      - name: Cleanup dev environment
+        if: always()
+        run: |
+          ./scripts/cleanup-aws.sh << EOF
+          ${{ secrets.AWS_REGION }}
+          N
+          dev
+          ${{ secrets.PROJECT_NAME }}
+          EOF
+    
+      - name: Create Pull Request to main
+        if: success()
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GH_BOT_TOKEN }}
+          base: main
+          branch: dev
+          title: "Promote dev to main"
+          body: |
+            This PR was automatically created after passing all integration tests.
+            Please review and approve to deploy to production.
+
+          commit-message: |
+            Automatic PR from CI/CD pipeline
+
+            This PR was automatically created after passing all integration tests.
+            [skip actions]
+
+  deploy-production:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache-dependency-path: backend/get_user_config/package-lock.json
+          cache: 'npm'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: '1.5.0'
+      
+      - name: Setup backend
+        run: |
+          ./scripts/init-backend.sh << EOF
+          ${{ secrets.AWS_REGION }}
+          ${{ secrets.ORGANIZATION_NAME }}
+          EOF
+
+      - name: Deploy to Production
+        run: |
+          ./scripts/init-project.sh << EOF
+          ${{ secrets.AWS_REGION }}
+          prod
+          ${{ secrets.PROJECT_NAME }}
+          EOF
+          ./scripts/deploy-project.sh
+
+      - name: Notify Production Deployment
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🚀 Production Deployment Complete"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: CI/CD Pipeline
+          body: Production deployment completed successfully.
+  
+      - name: ❌ Notify Production Deployment Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Production Deployment Failed"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: CI/CD Pipeline
+          body: Production deployment failed. Please check the logs in the Actions tab.
