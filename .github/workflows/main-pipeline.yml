@@ -169,21 +169,14 @@ jobs:
     
       - name: Create Pull Request to main
         if: success()
-        uses: peter-evans/create-pull-request@v5
-        with:
-          token: ${{ secrets.GH_BOT_TOKEN }}
-          base: main
-          branch: dev
-          title: "Promote dev to main"
-          body: |
-            This PR was automatically created after passing all integration tests.
-            Please review and approve to deploy to production.
-
-          commit-message: |
-            Automatic PR from CI/CD pipeline
-
-            This PR was automatically created after passing all integration tests.
-            [skip actions]
+        run: |
+          gh pr create \
+          --base main \
+          --head dev \
+          --title "Promote dev to main" \
+          --body "Auto-created PR after successful tests."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_BOT_TOKEN }}
 
   deploy-production:
     if: github.ref == 'refs/heads/main'
